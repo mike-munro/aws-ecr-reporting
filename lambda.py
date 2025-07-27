@@ -4,7 +4,7 @@
 import boto3
 import json
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from botocore.exceptions import ClientError
@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SecurityHubReportGenerator:
+class ECRVulnerabilityReportGenerator:
     def __init__(self, region_name='us-east-1', sns_topic_arn=None):
         self.region_name = region_name
         self.sns_topic_arn = sns_topic_arn
@@ -22,7 +22,8 @@ class SecurityHubReportGenerator:
         
     def _initialize_clients(self):
         """Initialize AWS clients with appropriate credentials."""
-        # Use Lambda execution role for SecurityHub and SNS
+        # Use Lambda execution role for Inspector, SecurityHub and SNS
+        self.inspector_client = boto3.client('inspector2', region_name=self.region_name)
         self.securityhub_client = boto3.client('securityhub', region_name=self.region_name)
         self.sns_client = boto3.client('sns', region_name=self.region_name)
         
@@ -111,7 +112,7 @@ class SecurityHubReportGenerator:
             )
             
             # Calculate actual expiry time
-            expiry_time = datetime.utcnow() + timedelta(seconds=max_expiry_seconds)
+            expiry_time = datetime.now(timezone.utc) + timedelta(seconds=max_expiry_seconds)
             logger.info(f"📅 Presigned URL expires at: {expiry_time.isoformat()} UTC")
             
             return presigned_url, max_expiry_seconds, credential_type
@@ -120,8 +121,41 @@ class SecurityHubReportGenerator:
             logger.error(f"❌ Error generating presigned URL: {e}")
             raise
         
-    def get_ecr_findings(self, days_back=7):
-        """Get ECR container vulnerability findings from Security Hub."""
+    def get_ecr_findings_from_inspector(self, days_back=7):
+        """Get ECR container vulnerability findings directly from Amazon Inspector with container usage data."""
+        try:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days_back)
+            
+            # Inspector filter criteria for ECR container image findings
+            filter_criteria = {
+                'resourceType': [{'comparison': 'EQUALS', 'value': 'ECR_CONTAINER_IMAGE'}],
+                'updatedAt': [{
+                    'startInclusive': start_date,
+                    'endInclusive': end_date
+                }],
+                'findingStatus': [{'comparison': 'EQUALS', 'value': 'ACTIVE'}]
+            }
+            
+            findings = []
+            paginator = self.inspector_client.get_paginator('list_findings')
+            
+            logger.info(f"Querying Inspector for ECR findings from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            
+            for page in paginator.paginate(filterCriteria=filter_criteria):
+                findings.extend(page['findings'])
+                
+            logger.info(f"Retrieved {len(findings)} ECR vulnerability findings from Inspector")
+            return findings
+            
+        except ClientError as e:
+            logger.error(f"Error retrieving ECR findings from Inspector: {e}")
+            # Fallback to Security Hub if Inspector fails
+            logger.info("Falling back to Security Hub for findings retrieval")
+            return self._get_ecr_findings_from_security_hub(days_back)
+        
+    def _get_ecr_findings_from_security_hub(self, days_back=7):
+        """Fallback method to get ECR findings from Security Hub."""
         try:
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days_back)
@@ -139,10 +173,10 @@ class SecurityHubReportGenerator:
             for page in paginator.paginate(Filters=filters):
                 findings.extend(page['Findings'])
                 
-            logger.info(f"Retrieved {len(findings)} ECR vulnerability findings")
+            logger.info(f"Retrieved {len(findings)} ECR vulnerability findings from Security Hub (fallback)")
             return findings
         except ClientError as e:
-            logger.error(f"Error retrieving ECR findings: {e}")
+            logger.error(f"Error retrieving ECR findings from Security Hub: {e}")
             return []
     
     def process_findings_data(self, findings):
@@ -189,6 +223,88 @@ class SecurityHubReportGenerator:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
         
         return df
+    
+    def process_inspector_findings_data(self, findings):
+        """Process Inspector findings into structured data with container usage information."""
+        processed_data = []
+        
+        for finding in findings:
+            # Extract basic finding information
+            finding_data = {
+                'id': finding.get('findingArn', ''),
+                'aws_account_id': finding.get('awsAccountId', ''),
+                'region': finding.get('region', ''),
+                'title': finding.get('title', ''),
+                'description': finding.get('description', ''),
+                'severity_label': finding.get('severity', ''),
+                'inspector_score': finding.get('inspectorScore', 0),
+                'inspector_score_details': json.dumps(finding.get('inspectorScoreDetails', {})),
+                'type': finding.get('type', ''),
+                'created_at': finding.get('firstObservedAt', ''),
+                'updated_at': finding.get('updatedAt', ''),
+                'status': finding.get('status', ''),
+                'remediation': json.dumps(finding.get('remediation', {})),
+                'package_vulnerability_details': json.dumps(finding.get('packageVulnerabilityDetails', {})),
+                'resources': []
+            }
+            
+            # Process resources with enhanced container usage data
+            for resource in finding.get('resources', []):
+                resource_data = {
+                    'resource_id': resource.get('id', ''),
+                    'resource_type': resource.get('type', ''),
+                    'resource_region': resource.get('region', ''),
+                    'resource_tags': json.dumps(resource.get('tags', {})),
+                    'resource_details': json.dumps(resource.get('details', {}))
+                }
+                
+                # Extract ECR container image specific details
+                if resource.get('type') == 'ECR_CONTAINER_IMAGE':
+                    ecr_details = resource.get('details', {}).get('ecrContainerImage', {})
+                    resource_data.update({
+                        'repository_name': ecr_details.get('repositoryName', ''),
+                        'image_id': ecr_details.get('imageId', ''),
+                        'image_tags': json.dumps(ecr_details.get('imageTags', [])),
+                        'platform': ecr_details.get('platform', ''),
+                        'pushed_at': ecr_details.get('pushedAt', ''),
+                        # Enhanced container usage data from Inspector
+                        'last_in_use_at': ecr_details.get('lastInUseAt', ''),
+                        'in_use_count': ecr_details.get('inUseCount', 0),
+                        'registry_id': ecr_details.get('registryId', ''),
+                        'repository_arn': ecr_details.get('repositoryArn', '')
+                    })
+                
+                finding_data['resources'].append(resource_data)
+            
+            processed_data.append(finding_data)
+        
+        # Flatten data for DataFrame processing
+        flattened_data = []
+        for finding in processed_data:
+            if finding['resources']:
+                for resource in finding['resources']:
+                    row = {**finding, **resource}
+                    del row['resources']
+                    flattened_data.append(row)
+            else:
+                del finding['resources']
+                flattened_data.append(finding)
+        
+        df = pd.DataFrame(flattened_data)
+        
+        # Convert date columns
+        date_columns = ['created_at', 'updated_at', 'pushed_at', 'last_in_use_at']
+        for col in date_columns:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+        
+        # Convert numeric columns
+        if 'in_use_count' in df.columns:
+            df['in_use_count'] = pd.to_numeric(df['in_use_count'], errors='coerce').fillna(0)
+        if 'inspector_score' in df.columns:
+            df['inspector_score'] = pd.to_numeric(df['inspector_score'], errors='coerce').fillna(0)
+        
+        return df
 
     def consolidate_findings(self, df):
         """Consolidate duplicate CVE findings per container image."""
@@ -197,7 +313,14 @@ class SecurityHubReportGenerator:
         
         logger.info(f"Consolidating findings... Original count: {len(df)}")
         
-        df['image_repository'] = df['resource_id'].str.extract(r'repository/([^/]+(?:/[^/]+)*?)(?:/sha256:|$)')
+        # Use Inspector repository_name if available, otherwise extract from resource_id
+        if 'repository_name' in df.columns:
+            df['image_repository'] = df['repository_name'].fillna(
+                df['resource_id'].str.extract(r'repository/([^/]+(?:/[^/]+)*?)(?:/sha256:|$)')[0]
+            )
+        else:
+            df['image_repository'] = df['resource_id'].str.extract(r'repository/([^/]+(?:/[^/]+)*?)(?:/sha256:|$)')
+        
         df['cve_id'] = df['title'].str.extract(r'(CVE-\d{4}-\d+)')
         df['cve_id'] = df['cve_id'].fillna('UNKNOWN-CVE')
         df['image_repository'] = df['image_repository'].fillna('UNKNOWN-REPO')
@@ -226,14 +349,55 @@ class SecurityHubReportGenerator:
         return consolidated_df
     
     def generate_summary_stats(self, df):
-        """Generate summary statistics from consolidated findings."""
+        """Generate summary statistics with enhanced container usage analysis."""
         if df.empty:
             return {'total_findings': 0, 'total_unique_cves': 0, 'total_duplicates_eliminated': 0,
-            'total_active_images': 0, 'severity_breakdown': {}, 'accounts_affected': 0}
+            'total_scanned_images': 0, 'total_active_images': 0, 'total_inactive_images': 0, 
+            'severity_breakdown': {}, 'accounts_affected': 0}
         
         total_duplicates = df['duplicate_count'].sum() - len(df)
         unique_cves = df['cve_id'].nunique()
-        total_active_images = df['resource_id'].nunique()
+        total_scanned_images = df['resource_id'].nunique()
+        
+        # Enhanced active image calculation using Inspector container usage data
+        active_images = set()
+        inactive_images = set()
+        
+        # Check if we have Inspector container usage data
+        if 'in_use_count' in df.columns and 'last_in_use_at' in df.columns:
+            logger.info("Using Inspector container usage data for active image calculation")
+            
+            # Images are considered active if they have in_use_count > 0 or recent last_in_use_at
+            current_time = datetime.now()
+            recent_threshold = current_time - timedelta(days=30)  # Consider images used in last 30 days as potentially active
+            
+            for _, row in df.iterrows():
+                resource_id = row.get('resource_id', '')
+                in_use_count = row.get('in_use_count', 0)
+                last_in_use_at = row.get('last_in_use_at')
+                
+                if resource_id:
+                    # Image is active if currently in use OR recently used
+                    is_active = False
+                    if in_use_count > 0:
+                        is_active = True
+                    elif pd.notna(last_in_use_at) and last_in_use_at >= recent_threshold:
+                        is_active = True
+                    
+                    if is_active:
+                        active_images.add(resource_id)
+                    else:
+                        inactive_images.add(resource_id)
+            
+            total_active_images = len(active_images)
+            total_inactive_images = len(inactive_images)
+            
+            logger.info(f"Container usage analysis: {total_active_images} active, {total_inactive_images} inactive images")
+        else:
+            # Fallback to original logic if Inspector data not available
+            logger.warning("Inspector container usage data not available, using fallback counting")
+            total_active_images = total_scanned_images
+            total_inactive_images = 0
         
         severity_scores = {'CRITICAL': 10, 'HIGH': 7, 'MEDIUM': 5, 'LOW': 3, 'INFORMATIONAL': 1}
         df['custom_criticality'] = df['severity_label'].map(severity_scores).fillna(0)
@@ -253,6 +417,27 @@ class SecurityHubReportGenerator:
                 # Calculate risk score for sorting
                 risk_score = (critical_count * 10) + (high_count * 7) + (medium_count * 5) + (low_count * 3) + (info_count * 1)
                 
+                # Enhanced repository analysis with container usage data
+                repo_active_images = 0
+                repo_inactive_images = 0
+                
+                if 'in_use_count' in repo_group.columns:
+                    # Count active vs inactive images for this repository
+                    for _, row in repo_group.iterrows():
+                        in_use_count = row.get('in_use_count', 0)
+                        last_in_use_at = row.get('last_in_use_at')
+                        
+                        is_active = False
+                        if in_use_count > 0:
+                            is_active = True
+                        elif pd.notna(last_in_use_at) and last_in_use_at >= recent_threshold:
+                            is_active = True
+                        
+                        if is_active:
+                            repo_active_images += 1
+                        else:
+                            repo_inactive_images += 1
+                
                 repo_stats.append({
                     'repository': repo_name,
                     'unique_cves': repo_group['cve_id'].nunique(),
@@ -262,19 +447,30 @@ class SecurityHubReportGenerator:
                     'medium': medium_count,
                     'low': low_count,
                     'informational': info_count,
-                    'risk_score': risk_score
+                    'risk_score': risk_score,
+                    'active_images': repo_active_images,
+                    'inactive_images': repo_inactive_images,
+                    'total_in_use_count': repo_group.get('in_use_count', pd.Series([0])).sum()
                 })
         
         # Sort by risk score (descending), then by unique CVEs (descending)
         repo_stats = sorted(repo_stats, key=lambda x: (x['risk_score'], x['unique_cves']), reverse=True)
         
         return {
-            'total_findings': len(df), 'total_unique_cves': unique_cves,
-            'total_duplicates_eliminated': int(total_duplicates), 'total_active_images': total_active_images,
-            'severity_breakdown': df['severity_label'].value_counts().to_dict(), 'avg_criticality': avg_criticality,
-            'accounts_affected': df['aws_account_id'].nunique(), 'regions_affected': df['region'].nunique(),
+            'total_findings': len(df), 
+            'total_unique_cves': unique_cves,
+            'total_duplicates_eliminated': int(total_duplicates), 
+            'total_scanned_images': total_scanned_images,
+            'total_active_images': total_active_images,
+            'total_inactive_images': total_inactive_images,
+            'active_image_percentage': round((total_active_images / max(total_scanned_images, 1)) * 100, 1),
+            'severity_breakdown': df['severity_label'].value_counts().to_dict(), 
+            'avg_criticality': avg_criticality,
+            'accounts_affected': df['aws_account_id'].nunique(), 
+            'regions_affected': df['region'].nunique(),
             'top_repositories': {repo['repository']: repo['unique_cves'] for repo in repo_stats[:10]},  # Keep existing format for compatibility
-            'repository_details': repo_stats[:20]  # Add detailed breakdown for top 20 repositories
+            'repository_details': repo_stats[:20],  # Add detailed breakdown for top 20 repositories
+            'container_usage_available': 'in_use_count' in df.columns and 'last_in_use_at' in df.columns
         }
 
     def create_html_report(self, df, summary):
@@ -319,9 +515,10 @@ class SecurityHubReportGenerator:
     <div class="summary">
     <h2>📊 Executive Summary</h2>
     <div class="metric-card"><div class="metric-value">{summary['total_active_images']}</div><div class="metric-label">Active Images</div></div>
+    <div class="metric-card"><div class="metric-value">{summary.get('total_inactive_images', 0)}</div><div class="metric-label">Inactive Images</div></div>
     <div class="metric-card"><div class="metric-value">{summary['total_findings']}</div><div class="metric-label">Vulnerabilities</div></div>
     <div class="metric-card"><div class="metric-value">{summary['total_unique_cves']}</div><div class="metric-label">Unique CVEs</div></div>
-    <div class="metric-card"><div class="metric-value">{summary['total_duplicates_eliminated']}</div><div class="metric-label">Duplicates Removed</div></div>
+    <div class="metric-card"><div class="metric-value">{summary.get('active_image_percentage', 0)}%</div><div class="metric-label">Active Rate</div></div>
     <div class="metric-card"><div class="metric-value">{summary['avg_criticality']:.1f}</div><div class="metric-label">Avg Criticality</div></div>
 
     <h3 style="margin-top: 30px; margin-bottom: 15px;">Severity Breakdown</h3>"""
@@ -331,6 +528,25 @@ class SecurityHubReportGenerator:
                 count = summary['severity_breakdown'][severity]
                 severity_class = severity.lower()
                 html_content += f'<div class="metric-card"><div class="metric-value {severity_class}">{count}</div><div class="metric-label">{severity}</div></div>'
+        
+        # Add container usage summary if available
+        if summary.get('container_usage_available', False):
+            html_content += f"""
+    <h3 style="margin-top: 30px; margin-bottom: 15px;">📈 Container Usage Analysis</h3>
+    <p><strong>Enhanced reporting using Amazon Inspector container mapping:</strong></p>
+    <ul>
+    <li>✅ <strong>Active Images:</strong> {summary['total_active_images']} images currently in use or recently used (last 30 days)</li>
+    <li>⚠️ <strong>Inactive Images:</strong> {summary.get('total_inactive_images', 0)} images with vulnerabilities but not currently running</li>
+    <li>📊 <strong>Usage Rate:</strong> {summary.get('active_image_percentage', 0)}% of vulnerable images are actively used</li>
+    </ul>
+    <p><em>Focus remediation efforts on the {summary['total_active_images']} active images to maximize security impact.</em></p>
+"""
+        else:
+            html_content += f"""
+    <h3 style="margin-top: 30px; margin-bottom: 15px;">⚠️ Container Usage Data</h3>
+    <p><strong>Note:</strong> Enhanced container usage data from Amazon Inspector is not available. Image counts reflect all scanned images.</p>
+    <p><em>To enable container usage tracking, ensure Amazon Inspector container mapping is activated.</em></p>
+"""
         
         html_content += f"""</div>
 
@@ -571,8 +787,16 @@ class SecurityHubReportGenerator:
             sns_subject = f"{env_prefix}ECR Vulnerability Report - {summary['total_findings']} findings ({critical_count} critical)"
             
             message = f"🐳 ECR Vulnerability Report - {datetime.now().strftime('%Y-%m-%d')}\n\n"
-            message += f"📊 SUMMARY\n"
-            message += f"• Active Images: {summary['total_active_images']}\n"
+            
+            # Enhanced summary with container usage data
+            if summary.get('container_usage_available', False):
+                message += f"📊 SUMMARY (Enhanced with Inspector Container Mapping)\n"
+                message += f"• Active Images: {summary['total_active_images']} (in use)\n"
+                message += f"• Inactive Images: {summary.get('total_inactive_images', 0)} (not in use)\n"
+                message += f"• Usage Rate: {summary.get('active_image_percentage', 0)}%\n"
+            else:
+                message += f"📊 SUMMARY\n"
+                message += f"• Scanned Images: {summary.get('total_scanned_images', summary['total_active_images'])}\n"
             message += f"• Vulnerabilities: {summary['total_findings']}\n"
             message += f"• Unique CVEs: {summary['total_unique_cves']}\n"
             message += f"• Critical: {critical_count} | High: {high_count}\n"
@@ -621,8 +845,20 @@ class SecurityHubReportGenerator:
         try:
             logger.info(f"Generating ECR report (last {days_back} days)...")
             
-            findings = self.get_ecr_findings(days_back)
-            df = self.process_findings_data(findings)
+            # Try Inspector first for enhanced container usage data, fallback to Security Hub
+            logger.info("Attempting to use Amazon Inspector for enhanced container usage data...")
+            findings = self.get_ecr_findings_from_inspector(days_back)
+            
+            # Check if we got Inspector data by looking for Inspector-specific fields
+            if findings and any('resources' in finding and 
+                              any(res.get('details', {}).get('ecrContainerImage', {}).get('inUseCount') is not None 
+                                  for res in finding.get('resources', []))
+                              for finding in findings):
+                logger.info("✅ Using Inspector data with container usage information")
+                df = self.process_inspector_findings_data(findings)
+            else:
+                logger.info("Using processed findings data (Security Hub format)")
+                df = self.process_findings_data(findings)
             consolidated_df = self.consolidate_findings(df)
             summary = self.generate_summary_stats(consolidated_df)
             html_content = self.create_html_report(consolidated_df, summary)
@@ -677,7 +913,7 @@ def lambda_handler(event, context):
         if url_expiry_days < 7:
             logger.warning(f"Short expiration configured: {expiry_text}")
         
-        generator = SecurityHubReportGenerator(region, sns_topic_arn)
+        generator = ECRVulnerabilityReportGenerator(region, sns_topic_arn)
         
         # Test connections
         try:
