@@ -7,7 +7,7 @@ import logging
 import os
 from botocore.exceptions import ClientError
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Lifecycle policy for pull-through cache repos
@@ -15,22 +15,22 @@ LIFECYCLE_POLICY = {
     "rules": [
         {
             "rulePriority": 1,
-            "description": "Delete images not pulled in 30 days",
+            "description": "Delete untagged images older than 1 day",
             "selection": {
-                "tagStatus": "any",
-                "countType": "sinceImagePulled",
+                "tagStatus": "untagged",
+                "countType": "sinceImagePushed",
                 "countUnit": "days",
-                "countNumber": 30
+                "countNumber": 1
             },
             "action": {"type": "expire"}
         },
         {
             "rulePriority": 2,
-            "description": "Keep only the latest 1 image",
+            "description": "Keep only 5 most recent tagged images",
             "selection": {
-                "tagStatus": "any",
+                "tagStatus": "tagged",
                 "countType": "imageCountMoreThan",
-                "countNumber": 1
+                "countNumber": 5
             },
             "action": {"type": "expire"}
         }
@@ -41,10 +41,10 @@ def get_pullthrough_cache_prefixes(ecr_client):
     try:
         response = ecr_client.describe_pull_through_cache_rules()
         prefixes = [rule['ecrRepositoryPrefix'] for rule in response['pullThroughCacheRules']]
-        logger.info(f"Found pull-through cache prefixes: {prefixes}")
+        print(f"Found pull-through cache prefixes: {prefixes}")
         return prefixes
     except ClientError as e:
-        logger.warning(f"Could not retrieve pull-through cache rules: {e}")
+        print(f"Could not retrieve pull-through cache rules: {e}")
         return []
 
 def is_pullthrough_cache_repo(repo_name, prefixes):
@@ -53,33 +53,52 @@ def is_pullthrough_cache_repo(repo_name, prefixes):
 
 def lambda_handler(event, context):
     """Apply ECR lifecycle policies to pull-through cache repositories."""
-    ecr_client = boto3.client('ecr')
-    dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+    print("=== ECR Lifecycle Manager started ===")
     
     try:
+        print("Initializing ECR client...")
+        ecr_client = boto3.client('ecr')
+        
+        dry_run_env = os.environ.get('DRY_RUN', 'false')
+        dry_run = dry_run_env.lower() == 'true'
+        print(f"DRY_RUN mode: {dry_run}")
+        
         # Get pull-through cache prefixes dynamically
         prefixes = get_pullthrough_cache_prefixes(ecr_client)
         
+        if not prefixes:
+            print("No pull-through cache prefixes found. No repositories will be processed.")
+            return {'statusCode': 200, 'processed': 0, 'message': 'No pull-through cache prefixes configured'}
+        
         # Get all repositories
+        print("Fetching ECR repositories...")
         paginator = ecr_client.get_paginator('describe_repositories')
         repositories = []
         for page in paginator.paginate():
             repositories.extend(page['repositories'])
         
+        print(f"Found {len(repositories)} total repositories")
+        
         processed = 0
+        skipped = 0
+        errors = 0
+        
         for repo in repositories:
             repo_name = repo['repositoryName']
             
             if is_pullthrough_cache_repo(repo_name, prefixes):
+                print(f"Processing pull-through cache repository: {repo_name}")
+                
                 if dry_run:
-                    logger.info(f"DRY RUN: Would apply lifecycle policy to {repo_name}")
+                    print(f"DRY RUN: Would apply lifecycle policy to {repo_name}")
                     processed += 1
                     continue
                 
                 try:
                     # Check if policy already exists
                     ecr_client.get_lifecycle_policy(repositoryName=repo_name)
-                    logger.info(f"Policy already exists for {repo_name}, skipping")
+                    print(f"Policy already exists for {repo_name}, skipping")
+                    skipped += 1
                 except ClientError as e:
                     if e.response['Error']['Code'] == 'LifecyclePolicyNotFoundException':
                         # Apply lifecycle policy
@@ -87,14 +106,27 @@ def lambda_handler(event, context):
                             repositoryName=repo_name,
                             lifecyclePolicyText=json.dumps(LIFECYCLE_POLICY)
                         )
-                        logger.info(f"Applied lifecycle policy to {repo_name}")
+                        print(f"Applied lifecycle policy to {repo_name}")
                         processed += 1
                     else:
-                        logger.error(f"Error checking {repo_name}: {e}")
+                        print(f"Error checking policy for {repo_name}: {e}")
+                        errors += 1
+                except Exception as e:
+                    print(f"Unexpected error processing {repo_name}: {e}")
+                    errors += 1
         
-        logger.info(f"Processed {processed} pull-through cache repositories")
-        return {'statusCode': 200, 'processed': processed}
+        print(f"Summary - Total: {len(repositories)}, Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
+        
+        return {
+            'statusCode': 200, 
+            'processed': processed,
+            'skipped': skipped,
+            'errors': errors,
+            'total_repositories': len(repositories)
+        }
         
     except Exception as e:
-        logger.error(f"Lambda execution failed: {e}")
+        print(f"Lambda execution failed: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return {'statusCode': 500, 'error': str(e)}
