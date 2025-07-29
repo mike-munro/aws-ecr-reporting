@@ -15,24 +15,28 @@ LIFECYCLE_POLICY = {
     "rules": [
         {
             "rulePriority": 1,
-            "description": "Delete untagged images older than 1 day",
+            "description": "Delete untagged images older than 7 days",
             "selection": {
                 "tagStatus": "untagged",
                 "countType": "sinceImagePushed",
                 "countUnit": "days",
-                "countNumber": 1
+                "countNumber": 7
             },
-            "action": {"type": "expire"}
+            "action": {
+                "type": "expire"
+            }
         },
         {
             "rulePriority": 2,
-            "description": "Keep only 5 most recent tagged images",
+            "description": "Keep only 10 most recent tagged images",
             "selection": {
                 "tagStatus": "tagged",
                 "countType": "imageCountMoreThan",
-                "countNumber": 5
+                "countNumber": 10
             },
-            "action": {"type": "expire"}
+            "action": {
+                "type": "expire"
+            }
         }
     ]
 }
@@ -102,9 +106,11 @@ def lambda_handler(event, context):
                 except ClientError as e:
                     if e.response['Error']['Code'] == 'LifecyclePolicyNotFoundException':
                         # Apply lifecycle policy
+                        policy_json = json.dumps(LIFECYCLE_POLICY)
+                        print(f"Applying policy to {repo_name}: {policy_json}")
                         ecr_client.put_lifecycle_policy(
                             repositoryName=repo_name,
-                            lifecyclePolicyText=json.dumps(LIFECYCLE_POLICY)
+                            lifecyclePolicyText=policy_json
                         )
                         print(f"Applied lifecycle policy to {repo_name}")
                         processed += 1
