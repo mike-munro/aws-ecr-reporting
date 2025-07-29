@@ -36,217 +36,65 @@ LIFECYCLE_POLICY = {
         }
     ]
 }
-        
-    def get_all_repositories(self):
-        """Get all ECR repositories in the region."""
-        try:
-            repositories = []
-            paginator = self.ecr_client.get_paginator('describe_repositories')
-            
-            for page in paginator.paginate():
-                repositories.extend(page['repositories'])
-            
-            logger.info(f"Found {len(repositories)} ECR repositories")
-            return repositories
-            
-        except ClientError as e:
-            logger.error(f"Error retrieving repositories: {e}")
-            raise
-            
-    def is_pullthrough_cache_repo(self, repository):
-        """
-        Determine if a repository is a pull-through cache repository.
-        Pull-through cache repos typically have specific naming patterns or registry IDs.
-        """
-        repo_name = repository['repositoryName']
-        repo_uri = repository['repositoryUri']
-        
-        # Common patterns for pull-through cache repositories
-        pullthrough_indicators = [
-            'ecr-public/',
-            'docker.io/',
-            'public.ecr.aws/',
-            'quay.io/',
-            'gcr.io/',
-            'k8s.gcr.io/',
-            'registry.k8s.io/',
-            'ghcr.io/'
-        ]
-        
-        # Check if repo name contains pull-through cache indicators
-        for indicator in pullthrough_indicators:
-            if indicator in repo_name.lower():
-                logger.info(f"Identified pull-through cache repo: {repo_name}")
-                return True
-                
-        # Additional check: repositories created through pull-through cache rules
-        # typically have specific registry patterns in their URIs
-        if any(pattern in repo_uri for pattern in pullthrough_indicators):
-            logger.info(f"Identified pull-through cache repo by URI pattern: {repo_name}")
-            return True
-            
-        return False
-        
-    def get_existing_lifecycle_policy(self, repository_name):
-        """Get existing lifecycle policy for a repository."""
-        try:
-            response = self.ecr_client.get_lifecycle_policy(
-                repositoryName=repository_name
-            )
-            return json.loads(response['lifecyclePolicyText'])
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'LifecyclePolicyNotFoundException':
-                logger.info(f"No existing lifecycle policy found for {repository_name}")
-                return None
-            else:
-                logger.error(f"Error getting lifecycle policy for {repository_name}: {e}")
-                raise
-                
-    def apply_lifecycle_policy(self, repository_name, policy=None):
-        """Apply lifecycle policy to a repository."""
-        if policy is None:
-            policy = self.default_lifecycle_policy
-            
-        try:
-            response = self.ecr_client.put_lifecycle_policy(
-                repositoryName=repository_name,
-                lifecyclePolicyText=json.dumps(policy)
-            )
-            
-            logger.info(f"✅ Successfully applied lifecycle policy to {repository_name}")
-            return response
-            
-        except ClientError as e:
-            logger.error(f"❌ Error applying lifecycle policy to {repository_name}: {e}")
-            raise
-            
-    def process_pullthrough_repositories(self, dry_run=False):
-        """
-        Process all repositories and apply lifecycle policies to pull-through cache repos.
-        
-        Args:
-            dry_run (bool): If True, only log what would be done without making changes
-        """
-        try:
-            repositories = self.get_all_repositories()
-            pullthrough_repos = []
-            processed_count = 0
-            error_count = 0
-            
-            for repo in repositories:
-                repo_name = repo['repositoryName']
-                
-                if self.is_pullthrough_cache_repo(repo):
-                    pullthrough_repos.append(repo_name)
-                    
-                    if dry_run:
-                        logger.info(f"🔍 DRY RUN: Would apply lifecycle policy to {repo_name}")
-                        processed_count += 1
-                        continue
-                    
-                    try:
-                        # Check if policy already exists
-                        existing_policy = self.get_existing_lifecycle_policy(repo_name)
-                        
-                        if existing_policy:
-                            logger.info(f"⚠️ Lifecycle policy already exists for {repo_name}, skipping")
-                        else:
-                            self.apply_lifecycle_policy(repo_name)
-                            processed_count += 1
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Failed to process {repo_name}: {e}")
-                        error_count += 1
-            
-            # Summary
-            total_pullthrough = len(pullthrough_repos)
-            action = "identified" if dry_run else "processed"
-            
-            logger.info(f"""
-📊 SUMMARY:
-   Total repositories: {len(repositories)}
-   Pull-through cache repositories {action}: {total_pullthrough}
-   Successfully {action}: {processed_count}
-   Errors: {error_count}
-   
-   Pull-through cache repositories:
-   {chr(10).join(f'   - {repo}' for repo in pullthrough_repos)}
-            """)
-            
-            return {
-                'total_repositories': len(repositories),
-                'pullthrough_repositories': pullthrough_repos,
-                'processed_count': processed_count,
-                'error_count': error_count,
-                'dry_run': dry_run
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Error processing repositories: {e}")
-            raise
+def get_pullthrough_cache_prefixes(ecr_client):
+    """Get ECR repository prefixes from configured pull-through cache rules."""
+    try:
+        response = ecr_client.describe_pull_through_cache_rules()
+        prefixes = [rule['ecrRepositoryPrefix'] for rule in response['pullThroughCacheRules']]
+        logger.info(f"Found pull-through cache prefixes: {prefixes}")
+        return prefixes
+    except ClientError as e:
+        logger.warning(f"Could not retrieve pull-through cache rules: {e}")
+        return []
+
+def is_pullthrough_cache_repo(repo_name, prefixes):
+    """Check if repository starts with any pull-through cache prefix."""
+    return any(repo_name.startswith(prefix) for prefix in prefixes)
 
 def lambda_handler(event, context):
-    """
-    AWS Lambda handler for ECR lifecycle policy management.
+    """Apply ECR lifecycle policies to pull-through cache repositories."""
+    ecr_client = boto3.client('ecr')
+    dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
     
-    Environment Variables:
-        DRY_RUN: Set to 'true' for dry run mode (default: false)
-    
-    Note: AWS_REGION is automatically available in Lambda environment
-    """
     try:
-        # Get configuration from environment
-        dry_run = os.environ.get('DRY_RUN', 'false').lower() == 'true'
-        region = os.environ.get('AWS_REGION', 'ap-southeast-2')
+        # Get pull-through cache prefixes dynamically
+        prefixes = get_pullthrough_cache_prefixes(ecr_client)
         
-        logger.info(f"🚀 Starting ECR Lifecycle Policy Manager")
-        logger.info(f"   Region: {region}")
-        logger.info(f"   Dry Run: {dry_run}")
+        # Get all repositories
+        paginator = ecr_client.get_paginator('describe_repositories')
+        repositories = []
+        for page in paginator.paginate():
+            repositories.extend(page['repositories'])
         
-        # Initialize manager (will use AWS_REGION automatically)
-        manager = ECRLifecyclePolicyManager()
+        processed = 0
+        for repo in repositories:
+            repo_name = repo['repositoryName']
+            
+            if is_pullthrough_cache_repo(repo_name, prefixes):
+                if dry_run:
+                    logger.info(f"DRY RUN: Would apply lifecycle policy to {repo_name}")
+                    processed += 1
+                    continue
+                
+                try:
+                    # Check if policy already exists
+                    ecr_client.get_lifecycle_policy(repositoryName=repo_name)
+                    logger.info(f"Policy already exists for {repo_name}, skipping")
+                except ClientError as e:
+                    if e.response['Error']['Code'] == 'LifecyclePolicyNotFoundException':
+                        # Apply lifecycle policy
+                        ecr_client.put_lifecycle_policy(
+                            repositoryName=repo_name,
+                            lifecyclePolicyText=json.dumps(LIFECYCLE_POLICY)
+                        )
+                        logger.info(f"Applied lifecycle policy to {repo_name}")
+                        processed += 1
+                    else:
+                        logger.error(f"Error checking {repo_name}: {e}")
         
-        # Process repositories
-        result = manager.process_pullthrough_repositories(dry_run=dry_run)
-        
-        # Prepare response
-        response = {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'ECR lifecycle policy management completed successfully',
-                'result': result,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        }
-        
-        logger.info("✅ ECR Lifecycle Policy Manager completed successfully")
-        return response
+        logger.info(f"Processed {processed} pull-through cache repositories")
+        return {'statusCode': 200, 'processed': processed}
         
     except Exception as e:
-        logger.error(f"❌ Lambda execution failed: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': str(e),
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        }
-
-if __name__ == "__main__":
-    # For local testing
-    logger.info("Running ECR Lifecycle Policy Manager locally")
-    
-    # Mock Lambda context for local testing
-    class MockContext:
-        def __init__(self):
-            self.function_name = "ecr-lifecycle-manager"
-            self.memory_limit_in_mb = 128
-            self.invoked_function_arn = "arn:aws:lambda:ap-southeast-2:123456789012:function:ecr-lifecycle-manager"
-            self.aws_request_id = "test-request-id"
-    
-    # Test with dry run enabled
-    os.environ['DRY_RUN'] = 'true'
-    os.environ['AWS_REGION'] = 'ap-southeast-2'  # For local testing
-    
-    result = lambda_handler({}, MockContext())
-    print(json.dumps(result, indent=2))
+        logger.error(f"Lambda execution failed: {e}")
+        return {'statusCode': 500, 'error': str(e)}
