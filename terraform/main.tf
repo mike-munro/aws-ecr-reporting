@@ -34,7 +34,8 @@ data "aws_iam_policy_document" "ecr_lifecycle_policy" {
     effect = "Allow"
     actions = [
       "ecr:DescribeRepositories",
-      "ecr:ListRepositories"
+      "ecr:ListRepositories",
+      "ecr:DescribePullThroughCacheRules"
     ]
     resources = ["*"]
   }
@@ -107,6 +108,7 @@ module "lambda_function" {
       actions = [
         "ecr:DescribeRepositories",
         "ecr:ListRepositories",
+        "ecr:DescribePullThroughCacheRules",
         "ecr:GetLifecyclePolicy",
         "ecr:PutLifecyclePolicy",
         "ecr:DeleteLifecyclePolicy"
